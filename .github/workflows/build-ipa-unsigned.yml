@@ -30,15 +30,36 @@ jobs:
           xcodebuild -version
           sw_vers
 
+      - name: Run pre-build scripts (best-effort)
+        shell: bash
+        run: |
+          # Copy xcconfig template if not already present
+          if [[ -f "template_setup.xcconfig" && ! -f "developer_setup.xcconfig" ]]; then
+            cp template_setup.xcconfig developer_setup.xcconfig
+          fi
+          # Run framework/resource fetch scripts if they exist and are executable
+          if [[ -f "./get_frameworks.sh" ]]; then
+            chmod +x ./get_frameworks.sh
+            ./get_frameworks.sh || true
+          fi
+          if [[ -f "./get_resources.sh" ]]; then
+            chmod +x ./get_resources.sh
+            ./get_resources.sh || true
+          fi
+
       - name: Select project/workspace + scheme
         id: detect
         shell: bash
         run: |
           set -euo pipefail
 
-          # Prefer workspace if present, else project.
-          WORKSPACE="$(ls -1 *.xcworkspace 2>/dev/null | head -n 1 || true)"
-          PROJECT="$(ls -1 *.xcodeproj 2>/dev/null | head -n 1 || true)"
+          # Use find -type d to avoid ls expanding directory contents.
+          # Prefer workspace if present at root, else project.
+          WORKSPACE="$(find . -maxdepth 1 -type d -name "*.xcworkspace" | head -n 1 || true)"
+          PROJECT="$(find . -maxdepth 1 -type d -name "*.xcodeproj" | head -n 1 || true)"
+          # Strip leading ./
+          WORKSPACE="${WORKSPACE#./}"
+          PROJECT="${PROJECT#./}"
 
           if [[ -n "$WORKSPACE" ]]; then
             echo "container_type=workspace" >> "$GITHUB_OUTPUT"
