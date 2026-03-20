@@ -1,0 +1,200 @@
+name: Build unsigned IPA (AltStore/SideStore)
+
+on:
+  workflow_dispatch:
+    inputs:
+      scheme:
+        description: "Optional: Xcode scheme to build (leave empty to auto-detect)"
+        required: false
+        default: ""
+      configuration:
+        description: "Build configuration"
+        required: false
+        default: "Release"
+
+jobs:
+  build-ipa:
+    runs-on: macos-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Show Xcode version
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          sw_vers
+
+      - name: Select project/workspace + scheme
+        id: detect
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Prefer workspace if present, else project.
+          WORKSPACE="$(ls -1 *.xcworkspace 2>/dev/null | head -n 1 || true)"
+          PROJECT="$(ls -1 *.xcodeproj 2>/dev/null | head -n 1 || true)"
+
+          if [[ -n "$WORKSPACE" ]]; then
+            echo "container_type=workspace" >> "$GITHUB_OUTPUT"
+            echo "container_path=$WORKSPACE" >> "$GITHUB_OUTPUT"
+            LIST_CMD=(xcodebuild -list -workspace "$WORKSPACE")
+          elif [[ -n "$PROJECT" ]]; then
+            echo "container_type=project" >> "$GITHUB_OUTPUT"
+            echo "container_path=$PROJECT" >> "$GITHUB_OUTPUT"
+            LIST_CMD=(xcodebuild -list -project "$PROJECT")
+          else
+            echo "❌ No se encontró .xcworkspace ni .xcodeproj en la raíz."
+            echo "Contenido actual:"
+            ls -la
+            exit 1
+          fi
+
+          echo "Detected: $([[ -n "$WORKSPACE" ]] && echo "$WORKSPACE" || echo "$PROJECT")"
+
+          # Determine scheme: prefer input, else try to auto-detect from xcodebuild -list output
+          INPUT_SCHEME="${{ inputs.scheme }}"
+          if [[ -n "$INPUT_SCHEME" ]]; then
+            SCHEME="$INPUT_SCHEME"
+          else
+            # Parse first scheme under "Schemes:" section (works for common xcodebuild -list formats)
+            RAW_LIST="$("${LIST_CMD[@]}")"
+            echo "$RAW_LIST"
+
+            SCHEME="$(echo "$RAW_LIST" \
+              | awk '
+                  BEGIN{inSchemes=0}
+                  /^Schemes:/{inSchemes=1; next}
+                  inSchemes && /^[[:space:]]+[[:alnum:][:punct:]]/ {gsub(/^[[:space:]]+/, "", $0); print $0; exit}
+                  inSchemes && NF==0 {next}
+                ' || true)"
+
+            if [[ -z "$SCHEME" ]]; then
+              echo "❌ No pude autodetectar el scheme. Pásalo manualmente en workflow_dispatch -> input 'scheme'."
+              exit 1
+            fi
+          fi
+
+          echo "scheme=$SCHEME" >> "$GITHUB_OUTPUT"
+          echo "Using scheme: $SCHEME"
+
+      - name: Install CocoaPods (if Podfile exists)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f "Podfile" ]]; then
+            echo "Podfile detected -> installing CocoaPods + running pod install"
+            sudo gem install cocoapods --no-document
+            pod repo update
+            # Use --project-directory . to keep it explicit
+            pod install --project-directory=.
+          else
+            echo "No Podfile found, skipping CocoaPods."
+          fi
+
+      - name: Resolve Swift Package dependencies (best-effort)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          CONTAINER_TYPE="${{ steps.detect.outputs.container_type }}"
+          CONTAINER_PATH="${{ steps.detect.outputs.container_path }}"
+          SCHEME="${{ steps.detect.outputs.scheme }}"
+
+          # Only run resolve if xcodebuild supports it for the container; harmless if no SPM.
+          if [[ "$CONTAINER_TYPE" == "workspace" ]]; then
+            xcodebuild -resolvePackageDependencies -workspace "$CONTAINER_PATH" -scheme "$SCHEME" || true
+          else
+            xcodebuild -resolvePackageDependencies -project "$CONTAINER_PATH" -scheme "$SCHEME" || true
+          fi
+
+      - name: Build (iphoneos, Release, code signing disabled)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          CONTAINER_TYPE="${{ steps.detect.outputs.container_type }}"
+          CONTAINER_PATH="${{ steps.detect.outputs.container_path }}"
+          SCHEME="${{ steps.detect.outputs.scheme }}"
+          CONFIG="${{ inputs.configuration }}"
+
+          DERIVED_DATA="$RUNNER_TEMP/DerivedData"
+          ARCHIVE_PATH="$RUNNER_TEMP/${SCHEME}.xcarchive"
+
+          COMMON_FLAGS=(
+            -scheme "$SCHEME"
+            -configuration "$CONFIG"
+            -sdk iphoneos
+            -destination "generic/platform=iOS"
+            -derivedDataPath "$DERIVED_DATA"
+            CODE_SIGNING_ALLOWED=NO
+            CODE_SIGNING_REQUIRED=NO
+            CODE_SIGN_IDENTITY=""
+            AD_HOC_CODE_SIGNING_ALLOWED=YES
+          )
+
+          if [[ "$CONTAINER_TYPE" == "workspace" ]]; then
+            BUILD_CONTAINER=(-workspace "$CONTAINER_PATH")
+          else
+            BUILD_CONTAINER=(-project "$CONTAINER_PATH")
+          fi
+
+          # Build (sometimes enough)
+          xcodebuild "${BUILD_CONTAINER[@]}" "${COMMON_FLAGS[@]}" clean build | xcpretty || {
+            echo "⚠️ build failed; re-running without xcpretty to show full logs"
+            xcodebuild "${BUILD_CONTAINER[@]}" "${COMMON_FLAGS[@]}" clean build
+          }
+
+          # Also create an archive so we have a predictable .app location
+          xcodebuild "${BUILD_CONTAINER[@]}" "${COMMON_FLAGS[@]}" -archivePath "$ARCHIVE_PATH" archive | xcpretty || {
+            echo "⚠️ archive failed; re-running without xcpretty to show full logs"
+            xcodebuild "${BUILD_CONTAINER[@]}" "${COMMON_FLAGS[@]}" -archivePath "$ARCHIVE_PATH" archive
+          }
+
+          echo "ARCHIVE_PATH=$ARCHIVE_PATH" >> "$GITHUB_ENV"
+
+      - name: Package .app into .ipa (Payload)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ARCHIVE_PATH="${ARCHIVE_PATH:?}"
+          APP_DIR="$ARCHIVE_PATH/Products/Applications"
+          if [[ ! -d "$APP_DIR" ]]; then
+            echo "❌ Expected Applications directory not found at: $APP_DIR"
+            echo "Archive contents:"
+            ls -la "$ARCHIVE_PATH" || true
+            exit 1
+          fi
+
+          APP_PATH="$(find "$APP_DIR" -maxdepth 1 -type d -name "*.app" | head -n 1 || true)"
+          if [[ -z "$APP_PATH" ]]; then
+            echo "❌ No .app found in archive at: $APP_DIR"
+            ls -la "$APP_DIR"
+            exit 1
+          fi
+
+          echo "Found app: $APP_PATH"
+
+          OUT_DIR="$RUNNER_TEMP/ipa-out"
+          PAYLOAD_DIR="$OUT_DIR/Payload"
+          mkdir -p "$PAYLOAD_DIR"
+          cp -R "$APP_PATH" "$PAYLOAD_DIR/"
+
+          IPA_NAME="Blink-unsigned-${{ github.run_number }}.ipa"
+          (cd "$OUT_DIR" && /usr/bin/zip -r "$IPA_NAME" Payload)
+
+          echo "IPA_PATH=$OUT_DIR/$IPA_NAME" >> "$GITHUB_ENV"
+          ls -lah "$OUT_DIR"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-ipa
+          path: ${{ env.IPA_PATH }}
+          if-no-files-found: error
