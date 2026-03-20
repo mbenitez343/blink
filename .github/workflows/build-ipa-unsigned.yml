@@ -1,6 +1,7 @@
 name: Build unsigned IPA (AltStore/SideStore)
 
 on:
+  pull_request:
   workflow_dispatch:
     inputs:
       scheme:
@@ -28,12 +29,13 @@ jobs:
         run: |
           set -euo pipefail
           # Select the newest Xcode 26.x available; iOS 26 APIs (UIGlassEffect, etc.) require this SDK.
-          XCODE26="$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1 || true)"
+          XCODE_VERSION=26
+          XCODE26="$(ls -d /Applications/Xcode_${XCODE_VERSION}*.app 2>/dev/null | sort -V | tail -1 || true)"
           if [[ -n "$XCODE26" ]]; then
             echo "Selecting $XCODE26"
             sudo xcode-select -s "$XCODE26/Contents/Developer"
           else
-            echo "❌ Xcode 26 not found in /Applications. Available Xcode installations:"
+            echo "❌ Xcode ${XCODE_VERSION} not found in /Applications. Available Xcode installations:"
             ls -d /Applications/Xcode*.app 2>/dev/null || true
             exit 1
           fi
@@ -168,7 +170,7 @@ jobs:
           CONTAINER_TYPE="${{ steps.detect.outputs.container_type }}"
           CONTAINER_PATH="${{ steps.detect.outputs.container_path }}"
           SCHEME="${{ steps.detect.outputs.scheme }}"
-          CONFIG="${{ inputs.configuration }}"
+          CONFIG="${{ inputs.configuration || 'Release' }}"
 
           DERIVED_DATA="$RUNNER_TEMP/DerivedData"
           ARCHIVE_PATH="$RUNNER_TEMP/${SCHEME}.xcarchive"
