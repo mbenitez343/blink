@@ -6,7 +6,7 @@ on:
       scheme:
         description: "Optional: Xcode scheme to build (leave empty to auto-detect)"
         required: false
-        default: ""
+        default: "Blink"
       configuration:
         description: "Build configuration"
         required: false
@@ -83,17 +83,29 @@ jobs:
           if [[ -n "$INPUT_SCHEME" ]]; then
             SCHEME="$INPUT_SCHEME"
           else
-            # Parse first scheme under "Schemes:" section (works for common xcodebuild -list formats)
+            # Parse schemes from xcodebuild -list output (section headers may be indented)
             RAW_LIST="$("${LIST_CMD[@]}")"
             echo "$RAW_LIST"
 
-            SCHEME="$(echo "$RAW_LIST" \
+            # Derive a candidate name from the container (e.g. "Blink" from "Blink.xcodeproj")
+            CONTAINER_NAME="$([[ -n "$WORKSPACE" ]] && echo "$WORKSPACE" || echo "$PROJECT")"
+            CONTAINER_BASENAME="${CONTAINER_NAME%%.*}"
+
+            # Parse all schemes (xcodebuild -list indents section headers with spaces)
+            ALL_SCHEMES="$(echo "$RAW_LIST" \
               | awk '
                   BEGIN{inSchemes=0}
-                  /^Schemes:/{inSchemes=1; next}
-                  inSchemes && /^[[:space:]]+[[:alnum:][:punct:]]/ {gsub(/^[[:space:]]+/, "", $0); print $0; exit}
-                  inSchemes && NF==0 {next}
+                  /^[[:space:]]*Schemes:/{inSchemes=1; next}
+                  inSchemes && /^[[:space:]]+[^[:space:]]/ {gsub(/^[[:space:]]+/, "", $0); print $0; next}
+                  inSchemes && /^[^[:space:]]/ {exit}
                 ' || true)"
+
+            # Prefer a scheme that exactly matches the container basename (e.g. "Blink")
+            SCHEME="$(echo "$ALL_SCHEMES" | grep -Fx "$CONTAINER_BASENAME" | head -n 1 || true)"
+            # Fall back to the first listed scheme
+            if [[ -z "$SCHEME" ]]; then
+              SCHEME="$(echo "$ALL_SCHEMES" | head -n 1 || true)"
+            fi
 
             if [[ -z "$SCHEME" ]]; then
               echo "❌ No pude autodetectar el scheme. Pásalo manualmente en workflow_dispatch -> input 'scheme'."
